@@ -1,4 +1,14 @@
+import { EditorialWorkflowError, Cursor, CURSOR_COMPATIBILITY_SYMBOL } from 'netlify-cms-lib-util';
 import AuthenticationPage from './AuthenticationPage';
+
+const maybe=(...args)=>{
+	if (args.length===0)
+		return undefined;
+	let value=args[0];
+	for (let i=1;i<args.length && value;i++)
+		value=args[i](value);
+	return value;
+};
 
 export default class WebDAVBackend {
 	constructor(config,options = {}) {
@@ -7,6 +17,13 @@ export default class WebDAVBackend {
 
 		this.url=this.withTrailingSlash(
 			config.get("backend").get("url")
+		);
+		this.mediaFolder=this.withTrailingSlash(
+			config.get("media_folder")
+		);
+		this.publicFolder=maybe(
+			config.get("public_folder"),
+			path=>this.withTrailingSlash(path)
 		);
 
 		// null auth initially
@@ -21,21 +38,21 @@ export default class WebDAVBackend {
 			//'authComponent',
 			//'restoreUser',
 			//'authenticate',
-			'logout',
+			//'logout',
 			'getToken',
 			'traverseCursor',
 			//'entriesByFolder',
-			'entriesByFiles',
+			//'entriesByFiles',
 			//'getEntry',
 			//'persistEntry',
 			'unpublishedEntries',
-			'unpublishedEntry',
+			//'unpublishedEntry',
 			'deleteUnpublishedEntry',
 			'updateUnpublishedEntryStatus',
 			'publishUnpublishedEntry',
 			//'getMedia',
-			'persistMedia',
-			'deleteFile'
+			//'persistMedia',
+			//'deleteFile'
 		]) {
 			this[m]=(...args) => { console.log(m,args); throw new Error(m); }
 		}
@@ -44,7 +61,7 @@ export default class WebDAVBackend {
 	// internal
 	withTrailingSlash(url) {
 		// check for trailing slash, if not add it!
-		if ( ! (/\/$/.exec(url)) ) {
+		if ( ! url.endsWith("/")) { // (/\/$/.exec(url)) ) {
 			return url+"/";
 		}
 		return url;
@@ -75,6 +92,11 @@ export default class WebDAVBackend {
 
 	authComponent() {
 		return AuthenticationPage;
+	}
+
+	logout() {
+		this.auth = null;
+		return null;
 	}
 
 	async authenticate(userobj) {
@@ -109,9 +131,9 @@ export default class WebDAVBackend {
 			let href=response.getElementsByTagNameNS("DAV:","href");
 			if (!href.length)
 				continue;
-			let name=href[0].textContent;
+			let path=href[0].textContent;
 			let coll=response.getElementsByTagNameNS("DAV:","collection");
-			listing.push({name,collection:coll.length!=0});
+			listing.push({path,label:path,collection:coll.length!=0});
 		}
 		return listing;
 	}
@@ -120,28 +142,46 @@ export default class WebDAVBackend {
 		const prefix=await this.propFind(url,0);
 		const listing=await this.propFind(url,1);
 		return (listing
-			.filter( (item)=>item.name.endsWith(ext) )
-			.map( (item)=>({name:item.name.substring( prefix[0].name.length ) }) )
+			.filter( (item)=>item.path.endsWith(ext) )
+			.map( (item)=>({...item,path:item.path.substring( prefix[0].path.length ) }) )
 		);
+	}
+
+	// internal
+	async fetchFilesToEntries(collection,files) {
+		const configFolder = collection.get('folder');
+		// NO LAZY LOADING RIGHT NOW...
+		const out = [];
+		for (let file of files) {
+			const path=(configFolder?this.withTrailingSlash(configFolder):"")+file.path;
+			let entry;
+			try {
+				entry=await this.getEntry(collection,"",path);
+			} catch (e) {
+				console.log(e);
+				continue;
+			}
+			out.push( {...entry,file:{...file,...entry.file}} ); 
+		}
+
+		return out;
 	}
 
 	async entriesByFolder(collection, ext) {
 		const configFolder = collection.get('folder');
 		const url=this.url+this.withTrailingSlash(configFolder);
 
-		const entriesByName = await this.propFindExt(url,".md");
+		const files = await this.propFindExt(url,".md");
 
-		// NO LAZY LOADING RIGHT NOW...
-		const out = [];
-		for (let wName of entriesByName) {
-			const path=this.withTrailingSlash(configFolder)+wName.name;
-			out.push( await this.getEntry(collection,"",path) );
-		}
-
-		return out;
+		return await this.fetchFilesToEntries(collection,files);
 	}
-	async getMedia() {
-		return []; //{file:{path:"Third"}},{file:{path:"Fourth"}}]
+	async entriesByFiles(collection) {
+		const configFolder = collection.get('folder');
+		const files = collection.get('files').map( collectionFile => ({
+			path: collectionFile.get('file'),
+			label: collection.get('label')
+		}));
+		return await this.fetchFilesToEntries( collection, files );
 	}
 
 	async getEntry(collection,slug,path) {
@@ -171,4 +211,52 @@ export default class WebDAVBackend {
 		return;
 	}
 
+	async persistMedia({fileObj}) {
+		const { name, size } = fileObj;
+		const path = this.mediaFolder+name;
+		const uurl = this.url+path;
+		const opts=this.makeAuthOpts( this.auth, "PUT" );
+		opts.body=fileObj;
+		const result = fetch( uurl, opts );
+		const purl = this.publicFolder?this.publicFolder+name:uurl;
+		const assetInfo = { id: path, name, size, path, url: purl };
+		
+		return assetInfo;
+	}
+
+	async deleteFile(path,info,collection) {
+		const opts=this.makeAuthOpts( this.auth, "DELETE" );
+		const result=await fetch(this.url+path,opts);
+		if (!result.ok)
+			throw new Error("DELETE problem on "+path+":"+result.status+" "+result.statusText);
+		return;
+	}
+
+	async getMedia() {
+		const mediaUrl = this.url+this.mediaFolder;
+		const mediaFiles = await this.propFind(mediaUrl,1);
+		//console.log(mediaFiles);
+		const relMediaFiles = mediaFiles
+			.map( item=>{
+				const uurl = item.path;
+				const name = uurl.substring(mediaUrl.length);
+				const path = this.mediaFolder+name;
+				const purl = this.publicFolder?this.publicFolder+name:uurl;
+				return {
+					...item,
+					id:path,
+					path,
+					name,
+					size:0,
+					url: purl
+				}})
+			.filter( item=>(!item.collection) );
+		//console.log(relMediaFiles);
+		return relMediaFiles; //{file:{path:"Third"}},{file:{path:"Fourth"}}]
+	}
+
+
+	async unpublishedEntry(collection, slug) {
+		throw new EditorialWorkflowError('content is not under editorial workflow',true);
+	}
 }
